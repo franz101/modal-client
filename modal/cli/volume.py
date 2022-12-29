@@ -50,7 +50,7 @@ async def list():
 
 def gen_usage_code(label):
     return f"""
-@stub.function(shared_volumes={{"/my_vol": modal.ref("{label}")}})
+@stub.function(shared_volumes={{"/my_vol": modal.SharedVolume.from_name("{label}")}})
 def some_func():
     os.listdir("/my_vol")
 """
@@ -101,6 +101,16 @@ async def ls(volume_name: str, path: str = typer.Argument(default="/")):
     else:
         for entry in entries:
             print(entry.path)
+
+    if path == "/" and not entries:
+        # TODO(erikbern): consider this a big fat TODO for
+        # rethinking how we create and work with shared volumes
+        # across cloud vendors
+        print(
+            "Note: this command only lists data in AWS."
+            " If you created data on an A100 running in GCP,"
+            " it will not be listed here."
+        )
 
 
 PIPE_PATH = Path("-")

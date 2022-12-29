@@ -6,7 +6,7 @@ import sys
 import warnings
 from datetime import date
 from enum import Enum
-from typing import AsyncGenerator, Collection, Dict, List, Optional, Union
+from typing import AsyncGenerator, Callable, Collection, Dict, List, Optional, Union
 
 from rich.tree import Tree
 
@@ -24,7 +24,7 @@ from .client import _Client
 from .config import config, logger
 from .exception import InvalidError, deprecation_warning
 from .functions import _Function, _FunctionHandle
-from .gpu import _GPUConfig
+from .gpu import GPU_T
 from .image import _Image
 from .mount import _create_client_mount, _Mount, client_mount_name
 from .object import Provider, Ref
@@ -87,6 +87,7 @@ class _Stub:
     _mounts: Collection[_Mount]
     _secrets: Collection[_Secret]
     _function_handles: Dict[str, _FunctionHandle]
+    _local_entrypoints: Dict[str, Callable]
 
     def __init__(
         self,
@@ -110,6 +111,7 @@ class _Stub:
         self._mounts = mounts
         self._secrets = secrets
         self._function_handles = {}
+        self._local_entrypoints = {}
         super().__init__()
 
     @property
@@ -207,6 +209,15 @@ class _Stub:
     ) -> AsyncGenerator[_App, None]:
         app_name = name if name is not None else self.description
         detach = mode == StubRunMode.DETACH
+        if mode == StubRunMode.DETACH:
+            post_init_state = api_pb2.APP_STATE_DETACHED
+        elif mode == StubRunMode.DEPLOY:
+            post_init_state = (
+                api_pb2.APP_STATE_UNSPECIFIED
+            )  # don't change the app state - deploy state is set by AppDeploy
+        else:
+            post_init_state = api_pb2.APP_STATE_EPHEMERAL
+
         if existing_app_id is not None:
             app = await _App._init_existing(self, client, existing_app_id)
         else:
@@ -229,7 +240,7 @@ class _Stub:
                 # Create all members
                 create_progress = Tree(step_progress("Creating objects..."), guide_style="gray50")
                 with output_mgr.ctx_if_visible(output_mgr.make_live(create_progress)):
-                    await app._create_all_objects(create_progress)
+                    await app._create_all_objects(create_progress, post_init_state)
                 create_progress.label = step_completed("Created objects.")
                 output_mgr.print_if_visible(create_progress)
 
@@ -317,6 +328,11 @@ class _Stub:
         This function is useful for developing and testing cron schedules, job queues, and webhooks,
         since they will run until the program is interrupted with `Ctrl + C` or other means.
         Any changes made to webhook handlers will show up almost immediately the next time the route is hit.
+
+        **Note**
+
+        Changes to decorator arguments (eg. `timeout`, `gpu`, `shared_volumes`) will not propogate on live updates,
+        just web handle function bodies. Stop and restart your webhook serving process to propogate these changes.
         """
         from ._watcher import TIMEOUT, watch
 
@@ -372,7 +388,7 @@ class _Stub:
     ):
         """Deploy an app and export its objects persistently.
 
-        Typically, using the command-line tool `modal app deploy <module or script>`
+        Typically, using the command-line tool `modal deploy <module or script>`
         should be used, instead of this method.
 
         **Usage:**
@@ -499,6 +515,39 @@ class _Stub:
     def registered_functions(self) -> List[str]:
         return list(self._function_handles.keys())
 
+    @property
+    def registered_entrypoints(self) -> Dict[str, Callable]:
+        return self._local_entrypoints
+
+    @decorator_with_options
+    def local_entrypoint(self, raw_f=None, name: Optional[str] = None):
+        """Decorate a function to be used as a CLI entrypoint for a Modal App.
+
+        These functions can be used to do initialization of apps using local
+        assets. Note that regular Modal functions can also be used as CLI entrypoints,
+        but unlike `local_entrypoint` Modal function are executed remotely.
+
+        E.g.
+        @stub.local_entrypoint
+        def main():
+            some_modal_function()
+
+        You can call the entrypoint function within a Modal run context
+        directly from the CLI:
+        ```
+        modal run stub_module.py
+        ```
+
+        If you have multiple `local_entrypoint` functions, you can qualify the name of your stub and function:
+        ```
+        modal run stub_module.py::stub.some_other_function
+        ```
+
+        """
+        info = FunctionInfo(raw_f, False, name_override=name)
+        self._local_entrypoints[info.get_tag()] = raw_f
+        return raw_f
+
     @decorator_with_options
     def function(
         self,
@@ -508,7 +557,7 @@ class _Stub:
         schedule: Optional[Schedule] = None,  # An optional Modal Schedule for the function
         secret: Optional[_Secret] = None,  # An optional Modal Secret with environment variables for the container
         secrets: Collection[_Secret] = (),  # Plural version of `secret` when multiple secrets are needed
-        gpu: Union[bool, _GPUConfig] = False,  # Whether a GPU is required
+        gpu: GPU_T = None,  # GPU specification as string ("any", "T4", "A10G", ...) or object (`modal.GPU.A100()`, ...)
         rate_limit: Optional[RateLimit] = None,  # Optional RateLimit for the function
         serialized: bool = False,  # Whether to send the function over using cloudpickle.
         mounts: Collection[_Mount] = (),
@@ -522,9 +571,10 @@ class _Stub:
         timeout: Optional[int] = None,  # Maximum execution time of the function in seconds.
         interactive: bool = False,  # Whether to run the function in interactive mode.
         _is_build_step: bool = False,  # Whether function is a build step; reserved for internal use.
-        keep_warm: bool = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
+        keep_warm: Union[bool, int] = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
         name: Optional[str] = None,  # Sets the Modal name of the function within the stub
         is_generator: Optional[bool] = None,  # If not set, it's inferred from the function signature
+        cloud: Optional[str] = None,  # Cloud provider to run the function on. Possible values are aws, gcp, auto.
     ) -> _FunctionHandle:  # Function object - callable as a regular function within a Modal app
         """Decorator to register a new Modal function with this stub."""
         if image is None:
@@ -565,6 +615,7 @@ class _Stub:
             interactive=interactive,
             keep_warm=keep_warm,
             name=name,
+            cloud_provider=cloud,
         )
 
         if _is_build_step:
@@ -585,11 +636,12 @@ class _Stub:
         raw_f,
         *,
         method: str = "GET",  # REST method for the created endpoint.
+        label: str = None,  # Label for created endpoint. Final subdomain will be <workspace>--<label>.modal.run.
         wait_for_response: bool = True,  # Whether requests should wait for and return the function response.
         image: _Image = None,  # The image to run as the container for the function
         secret: Optional[_Secret] = None,  # An optional Modal Secret with environment variables for the container
         secrets: Collection[_Secret] = (),  # Plural version of `secret` when multiple secrets are needed
-        gpu: Union[bool, _GPUConfig] = False,  # Whether a GPU is required
+        gpu: GPU_T = None,  # GPU specification as string ("any", "T4", "A10G", ...) or object (`modal.GPU.A100()`, ...)
         mounts: Collection[_Mount] = (),
         shared_volumes: Dict[str, _SharedVolume] = {},
         cpu: Optional[float] = None,  # How many CPU cores to request. This is a soft limit.
@@ -599,7 +651,8 @@ class _Stub:
         concurrency_limit: Optional[int] = None,  # Limit for max concurrent containers running the function.
         container_idle_timeout: Optional[int] = None,  # Timeout for idle containers waiting for inputs to shut down.
         timeout: Optional[int] = None,  # Maximum execution time of the function in seconds.
-        keep_warm: bool = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
+        keep_warm: Union[bool, int] = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
+        cloud: Optional[str] = None,  # Cloud provider to run the function on. Possible values are aws, gcp, auto.
     ):
         """Register a basic web endpoint with this application.
 
@@ -629,7 +682,10 @@ class _Stub:
             mounts=mounts,
             shared_volumes=shared_volumes,
             webhook_config=api_pb2.WebhookConfig(
-                type=api_pb2.WEBHOOK_TYPE_FUNCTION, method=method, wait_for_response=wait_for_response
+                type=api_pb2.WEBHOOK_TYPE_FUNCTION,
+                method=method,
+                wait_for_response=wait_for_response,
+                requested_suffix=label,
             ),
             cpu=cpu,
             memory=memory,
@@ -639,6 +695,7 @@ class _Stub:
             container_idle_timeout=container_idle_timeout,
             timeout=timeout,
             keep_warm=keep_warm,
+            cloud_provider=cloud,
         )
         return self._add_function(function)
 
@@ -647,11 +704,12 @@ class _Stub:
         self,
         asgi_app,  # The asgi app
         *,
+        label: str = None,  # Label for created endpoint. Final subdomain will be <workspace>--<label>.modal.run.
         wait_for_response: bool = True,  # Whether requests should wait for and return the function response.
         image: _Image = None,  # The image to run as the container for the function
         secret: Optional[_Secret] = None,  # An optional Modal Secret with environment variables for the container
         secrets: Collection[_Secret] = (),  # Plural version of `secret` when multiple secrets are needed
-        gpu: Union[bool, _GPUConfig] = False,  # Whether a GPU is required
+        gpu: GPU_T = None,  # GPU specification as string ("any", "T4", "A10G", ...) or object (`modal.GPU.A100()`, ...)
         mounts: Collection[_Mount] = (),
         shared_volumes: Dict[str, _SharedVolume] = {},
         cpu: Optional[float] = None,  # How many CPU cores to request. This is a soft limit.
@@ -661,7 +719,8 @@ class _Stub:
         concurrency_limit: Optional[int] = None,  # Limit for max concurrent containers running the function.
         container_idle_timeout: Optional[int] = None,  # Timeout for idle containers waiting for inputs to shut down.
         timeout: Optional[int] = None,  # Maximum execution time of the function in seconds.
-        keep_warm: bool = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
+        keep_warm: Union[bool, int] = False,  # Toggles an adaptively-sized warm pool for latency-sensitive apps.
+        cloud: Optional[str] = None,  # Cloud provider to run the function on. Possible values are aws, gcp, auto.
         _webhook_type=api_pb2.WEBHOOK_TYPE_ASGI_APP,
     ):
         """Register an ASGI app with this application.
@@ -687,7 +746,9 @@ class _Stub:
             gpu=gpu,
             mounts=mounts,
             shared_volumes=shared_volumes,
-            webhook_config=api_pb2.WebhookConfig(type=_webhook_type, wait_for_response=wait_for_response),
+            webhook_config=api_pb2.WebhookConfig(
+                type=_webhook_type, wait_for_response=wait_for_response, requested_suffix=label
+            ),
             cpu=cpu,
             memory=memory,
             proxy=proxy,
@@ -696,6 +757,7 @@ class _Stub:
             container_idle_timeout=container_idle_timeout,
             timeout=timeout,
             keep_warm=keep_warm,
+            cloud_provider=cloud,
         )
         return self._add_function(function)
 
@@ -721,7 +783,7 @@ class _Stub:
         ```python
         import modal
 
-        stub = modal.Stub(image=modal.Image.debian_slim().apt_install(["vim"]))
+        stub = modal.Stub(image=modal.Image.debian_slim().apt_install("vim"))
 
         if __name__ == "__main__":
             stub.interactive_shell("/bin/bash")
@@ -733,7 +795,7 @@ class _Stub:
         import modal
 
         stub = modal.Stub()
-        app_image = modal.Image.debian_slim().apt_install(["vim"])
+        app_image = modal.Image.debian_slim().apt_install("vim")
 
         if __name__ == "__main__":
             stub.interactive_shell(cmd="/bin/bash", image=app_image)
@@ -744,7 +806,7 @@ class _Stub:
         )
 
         async with self.run():
-            await wrapped_fn(cmd)
+            await wrapped_fn.call(cmd)
 
 
 Stub, AioStub = synchronize_apis(_Stub)

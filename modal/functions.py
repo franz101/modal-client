@@ -1,13 +1,13 @@
 # Copyright Modal Labs 2022
 import asyncio
-from datetime import date
 import inspect
 import os
 import platform
 import time
 import warnings
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import (
     Any,
@@ -50,7 +50,7 @@ from .client import _Client
 from .exception import ExecutionError, InvalidError, NotFoundError, RemoteError
 from .exception import TimeoutError as _TimeoutError
 from .exception import deprecation_error, deprecation_warning
-from .gpu import _GPUConfig
+from .gpu import GPU_T, parse_gpu_config
 from .image import _Image
 from .mount import _Mount
 from .object import Handle, Provider, Ref, RemoteRef
@@ -62,12 +62,27 @@ from .shared_volume import _SharedVolume
 
 
 def exc_with_hints(exc: BaseException):
+    """mdmd:hidden"""
     if isinstance(exc, ImportError) and exc.msg == "attempted relative import with no known parent package":
         exc.msg += """\n
 HINT: For relative imports to work, you might need to run your modal app as a module. Try:
 - `python -m my_pkg.my_app` instead of `python my_pkg/my_app.py`
-- `modal app deploy my_pkg.my_app` instead of `modal app deploy my_pkg/my_app.py`
+- `modal deploy my_pkg.my_app` instead of `modal deploy my_pkg/my_app.py`
 """
+    elif isinstance(
+        exc, RuntimeError
+    ) and "CUDA error: no kernel image is available for execution on the device" in str(exc):
+        msg = (
+            exc.args[0]
+            + """\n
+HINT: This error usually indicates an outdated CUDA version. Older versions of torch (<=1.12)
+come with CUDA 10.2 by default. If pinning to an older torch version, you can specify a CUDA version
+manually, for example:
+-  image.pip_install("torch==1.12.1+cu116", find_links="https://download.pytorch.org/whl/torch_stable.html")
+"""
+        )
+        exc.args = (msg,)
+
     return exc
 
 
@@ -580,7 +595,7 @@ class _FunctionHandle(Handle, type_prefix="fu"):
             return self.call_function(args, kwargs)
 
     async def enqueue(self, *args, **kwargs):
-        """**Deprecated.** Use `.submit()` instead when possible.
+        """**Deprecated.** Use `.spawn()` instead when possible.
 
         Calls the function with the given arguments, without waiting for the results.
         """
@@ -592,7 +607,7 @@ class _FunctionHandle(Handle, type_prefix="fu"):
         Returns a `modal.functions.FunctionCall` object, that can later be polled or waited for using `.get(timeout=...)`.
         Conceptually similar to `multiprocessing.pool.apply_async`, or a Future/Promise in other contexts.
 
-        *Note:* `.submit()` on a modal generator function does call and execute the generator, but does not currently
+        *Note:* `.spawn()` on a modal generator function does call and execute the generator, but does not currently
         return a function handle for polling the result.
         """
         if self._is_generator:
@@ -603,6 +618,7 @@ class _FunctionHandle(Handle, type_prefix="fu"):
         return _FunctionCall(invocation.client, invocation.function_call_id)
 
     async def submit(self, *args, **kwargs) -> Optional["_FunctionCall"]:
+        """**Deprecated.** Use `.spawn()` instead."""
         deprecation_warning(date(2022, 12, 5), "Function.submit is deprecated, use .spawn() instead")
         return await self.spawn(*args, **kwargs)
 
@@ -623,6 +639,26 @@ class _FunctionHandle(Handle, type_prefix="fu"):
 FunctionHandle, AioFunctionHandle = synchronize_apis(_FunctionHandle)
 
 
+class CloudProvider(Enum):
+    AWS = api_pb2.CLOUD_PROVIDER_AWS
+    GCP = api_pb2.CLOUD_PROVIDER_GCP
+    AUTO = api_pb2.CLOUD_PROVIDER_AUTO
+
+
+def parse_cloud_provider(value: str, gpu_config: api_pb2.GPUConfig) -> "api_pb2.CloudProvider.V":
+    """mdmd:hidden"""
+    try:
+        cloud_provider = CloudProvider[value.upper()]
+    except KeyError:
+        raise InvalidError(
+            f"Invalid cloud provider: {value}. Value must be one of {[x.name.lower() for x in CloudProvider]} (case-insensitive)."
+        )
+    if cloud_provider != CloudProvider.AWS and gpu_config.type != api_pb2.GPU_TYPE_A100:
+        raise InvalidError("Cloud selection only supported for functions running with A100 GPUs.")
+
+    return cloud_provider.value
+
+
 class _Function(Provider[_FunctionHandle]):
     """Functions are the basic units of serverless execution on Modal.
 
@@ -640,7 +676,7 @@ class _Function(Provider[_FunctionHandle]):
         secrets: Collection[_Secret] = (),
         schedule: Optional[Schedule] = None,
         is_generator=False,
-        gpu: Union[bool, _GPUConfig] = False,
+        gpu: GPU_T = None,
         rate_limit: Optional[RateLimit] = None,
         # TODO: maybe break this out into a separate decorator for notebooks.
         serialized: bool = False,
@@ -654,9 +690,10 @@ class _Function(Provider[_FunctionHandle]):
         concurrency_limit: Optional[int] = None,
         container_idle_timeout: Optional[int] = None,
         cpu: Optional[float] = None,
-        keep_warm: bool = False,
+        keep_warm: Union[bool, int] = False,
         interactive: bool = False,
         name: Optional[str] = None,
+        cloud_provider: Optional[str] = None,
     ) -> None:
         """mdmd:hidden"""
         raw_f = function_info.raw_f
@@ -705,9 +742,9 @@ class _Function(Provider[_FunctionHandle]):
         else:
             retry_policy = None
 
+        self._gpu = gpu
         self._schedule = schedule
         self._is_generator = is_generator
-        self._gpu = gpu
         self._rate_limit = rate_limit
         self._mounts = mounts
         self._shared_volumes = shared_volumes
@@ -722,6 +759,8 @@ class _Function(Provider[_FunctionHandle]):
         self._keep_warm = keep_warm
         self._interactive = interactive
         self._tag = self._info.get_tag()
+        self._gpu_config = parse_gpu_config(gpu)
+        self._cloud_provider = parse_cloud_provider(cloud_provider, self._gpu_config) if cloud_provider else None
         super().__init__()
 
     async def _load(self, client, stub, app_id, loader, message_callback, existing_function_id):
@@ -822,10 +861,10 @@ class _Function(Provider[_FunctionHandle]):
             if cls:
                 class_serialized = cloudpickle.dumps(cls)
 
-        if isinstance(self._gpu, _GPUConfig):
-            resources = api_pb2.Resources(milli_cpu=milli_cpu, gpu_config=self._gpu._to_proto(), memory_mb=self._memory)
+        if self._keep_warm is True:
+            warm_pool_size = 2
         else:
-            resources = api_pb2.Resources(milli_cpu=milli_cpu, gpu=self._gpu, memory_mb=self._memory)
+            warm_pool_size = self._keep_warm or 0
 
         # Create function remotely
         function_definition = api_pb2.Function(
@@ -838,7 +877,7 @@ class _Function(Provider[_FunctionHandle]):
             function_serialized=function_serialized,
             class_serialized=class_serialized,
             function_type=function_type,
-            resources=resources,
+            resources=api_pb2.Resources(milli_cpu=milli_cpu, gpu_config=self._gpu_config, memory_mb=self._memory),
             rate_limit=rate_limit,
             webhook_config=self._webhook_config,
             shared_volume_mounts=shared_volume_mounts,
@@ -847,8 +886,9 @@ class _Function(Provider[_FunctionHandle]):
             timeout_secs=self._timeout,
             task_idle_timeout_secs=self._container_idle_timeout,
             concurrency_limit=self._concurrency_limit,
-            keep_warm=self._keep_warm,
             pty_info=pty_info,
+            cloud_provider=self._cloud_provider,
+            warm_pool_size=warm_pool_size,
         )
         request = api_pb2.FunctionCreateRequest(
             app_id=app_id,
@@ -883,7 +923,7 @@ Function, AioFunction = synchronize_apis(_Function)
 class _FunctionCall(Handle, type_prefix="fc"):
     """A reference to an executed function call
 
-    Constructed using `.submit(...)` on a Modal function with the same
+    Constructed using `.spawn(...)` on a Modal function with the same
     arguments that a function normally takes. Acts as a reference to
     an ongoing function call that can be passed around and used to
     poll or fetch function results at some later time.
@@ -917,7 +957,7 @@ FunctionCall, AioFunctionCall = synchronize_apis(_FunctionCall)
 async def _gather(*function_calls: _FunctionCall):
     """Wait until all Modal function calls have results before returning
 
-    Accepts a variable number of FunctionCall objects as returned by `Function.submit()`.
+    Accepts a variable number of FunctionCall objects as returned by `Function.spawn()`.
 
     Returns a list of results from each function call, or raises an exception
     of the first failing function call.
@@ -925,8 +965,8 @@ async def _gather(*function_calls: _FunctionCall):
     E.g.
 
     ```python notest
-    function_call_1 = slow_func_1.submit()
-    function_call_2 = slow_func_2.submit()
+    function_call_1 = slow_func_1.spawn()
+    function_call_2 = slow_func_2.spawn()
 
     result_1, result_2 = gather(function_call_1, function_call_2)
     ```

@@ -1,5 +1,6 @@
 # Copyright Modal Labs 2022
 from __future__ import annotations
+
 import asyncio
 import contextlib
 import inspect
@@ -38,6 +39,7 @@ class MockClientServicer(api_grpc.ModalClientBase):
     container_outputs: list[api_pb2.FunctionPutOutputsRequest]
 
     def __init__(self, blob_host, blobs):
+        self.app_state = {}
         self.n_blobs = 0
         self.blob_host = blob_host
         self.blobs = blobs  # shared dict
@@ -105,6 +107,13 @@ class MockClientServicer(api_grpc.ModalClientBase):
         self.requests.append(request)
         self.n_apps += 1
         app_id = f"ap-{self.n_apps}"
+        if request.initializing:
+            state = api_pb2.APP_STATE_INITIALIZING
+        elif request.detach:
+            state = api_pb2.APP_STATE_DETACHED
+        else:
+            state = api_pb2.APP_STATE_EPHEMERAL
+        self.app_state[app_id] = state
         await stream.send_message(api_pb2.AppCreateResponse(app_id=app_id))
 
     async def AppClientDisconnect(self, stream):
@@ -122,16 +131,20 @@ class MockClientServicer(api_grpc.ModalClientBase):
     async def AppGetObjects(self, stream):
         request: api_pb2.AppGetObjectsRequest = await stream.recv_message()
         object_ids = self.app_objects.get(request.app_id, {})
-        await stream.send_message(api_pb2.AppGetObjectsResponse(object_ids=object_ids))
+        items = [api_pb2.AppGetObjectsItem(tag=tag, object_id=object_id) for tag, object_id in object_ids.items()]
+        await stream.send_message(api_pb2.AppGetObjectsResponse(items=items))
 
     async def AppSetObjects(self, stream):
         request: api_pb2.AppSetObjectsRequest = await stream.recv_message()
         self.app_objects[request.app_id] = dict(request.indexed_object_ids)
+        if request.new_app_state:
+            self.app_state[request.app_id] = request.new_app_state
         await stream.send_message(Empty())
 
     async def AppDeploy(self, stream):
         request: api_pb2.AppDeployRequest = await stream.recv_message()
         self.deployed_apps[request.name] = request.app_id
+        self.app_state[request.app_id] = api_pb2.APP_STATE_DEPLOYED
         await stream.send_message(api_pb2.AppDeployResponse(url="http://test.modal.com/foo/bar"))
 
     async def AppGetByDeploymentName(self, stream):
@@ -211,7 +224,7 @@ class MockClientServicer(api_grpc.ModalClientBase):
             self.rate_limit_sleep_duration = None
             await stream.send_message(api_pb2.FunctionGetInputsResponse(rate_limit_sleep_duration=s))
         elif not self.container_inputs:
-            await asyncio.sleep(request.timeout)
+            await asyncio.sleep(1.0)
             await stream.send_message(api_pb2.FunctionGetInputsResponse(inputs=[]))
         else:
             await stream.send_message(self.container_inputs.pop(0))
@@ -490,7 +503,7 @@ async def aio_container_client(unix_servicer):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def server_url_env(servicer, monkeypatch):
+async def server_url_env(servicer, monkeypatch, set_env_client):
     monkeypatch.setenv("MODAL_SERVER_URL", servicer.remote_addr)
     yield
 

@@ -23,11 +23,11 @@ class _App:
     is running, you can get its `app_id`, `client`, and other useful properties
     from this object.
 
-    ```
+    ```python
     import modal
 
     stub = modal.Stub()
-    stub.my_secret_object = modal.ref("my-secret")
+    stub.my_secret_object = modal.Secret.from_name("my-secret")
 
     if __name__ == "__main__":
         with stub.run() as app:
@@ -132,7 +132,7 @@ class _App:
         """
         return self._local_uuid_to_object.get(obj.local_uuid)
 
-    async def _create_all_objects(self, progress: Tree):
+    async def _create_all_objects(self, progress: Tree, new_app_state: int):  # api_pb2.AppState.ValueType
         """Create objects that have been defined but not created on the server."""
         for tag, provider in self._stub._blueprint.items():
             existing_object_id = self._tag_to_existing_id.get(tag)
@@ -151,6 +151,7 @@ class _App:
             client_id=self._client.client_id,
             indexed_object_ids=indexed_object_ids,
             unindexed_object_ids=unindexed_object_ids,
+            new_app_state=new_app_state,  # type: ignore
         )
         await self._client.stub.AppSetObjects(req_set)
         return self._tag_to_object
@@ -211,7 +212,8 @@ class _App:
         obj_req = api_pb2.AppGetObjectsRequest(app_id=existing_app_id)
         obj_resp = await retry_transient_errors(client.stub.AppGetObjects, obj_req)
         app_page_url = f"https://modal.com/apps/{existing_app_id}"  # TODO (elias): this should come from the backend
-        return _App(stub, client, existing_app_id, app_page_url, tag_to_existing_id=dict(obj_resp.object_ids))
+        object_ids = {item.tag: item.object_id for item in obj_resp.items}
+        return _App(stub, client, existing_app_id, app_page_url, tag_to_existing_id=object_ids)
 
     @staticmethod
     async def _init_new(stub, client, description, detach, deploying) -> "_App":
@@ -220,7 +222,7 @@ class _App:
         app_req = api_pb2.AppCreateRequest(
             client_id=client.client_id,
             description=description,
-            deploying=deploying,
+            initializing=deploying,
             detach=detach,
         )
         app_resp = await retry_transient_errors(client.stub.AppCreate, app_req)

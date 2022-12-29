@@ -4,7 +4,7 @@ import pytest
 import sys
 from typing import List
 
-from modal import Image, Secret, SharedVolume, Stub
+from modal import Image, Mount, Secret, SharedVolume, Stub
 from modal.exception import InvalidError, NotFoundError
 from modal.image import _dockerhub_python_version
 from modal_proto import api_pb2
@@ -44,7 +44,7 @@ def get_image_layers(image_id: str, servicer) -> List[api_pb2.Image]:
 
 def test_image_python_packages(client, servicer):
     stub = Stub()
-    stub["image"] = Image.debian_slim().pip_install(["numpy"])
+    stub["image"] = Image.debian_slim().pip_install("numpy")
     with stub.run(client=client) as running_app:
         layers = get_image_layers(running_app["image"].object_id, servicer)
         assert any("pip install numpy" in cmd for cmd in layers[0].dockerfile_commands)
@@ -54,8 +54,14 @@ def test_wrong_type(servicer, client):
     image = Image.debian_slim()
     for method in [image.pip_install, image.apt_install, image.run_commands]:
         method(["xyz"])
+        method("xyz")
+        method("xyz", ["def", "foo"], "ghi")
         with pytest.raises(InvalidError):
-            method("xyz")
+            method(3)
+        with pytest.raises(InvalidError):
+            method([3])
+        with pytest.raises(InvalidError):
+            method([["double-nested-package"]])
 
 
 def test_image_requirements_txt(servicer, client):
@@ -72,11 +78,15 @@ def test_image_requirements_txt(servicer, client):
 
 
 def test_empty_install(servicer, client):
-    with pytest.raises(TypeError):
-        Image.debian_slim().pip_install()  # Missing positional argument `packages`
-
     # Install functions with no packages should be ignored.
-    stub = Stub(image=Image.debian_slim().pip_install([]).apt_install([]))
+    stub = Stub(
+        image=Image.debian_slim()
+        .pip_install()
+        .pip_install([], [], [], [])
+        .apt_install([])
+        .run_commands()
+        .conda_install()
+    )
 
     with stub.run(client=client) as running_app:
         layers = get_image_layers(running_app["image"].object_id, servicer)
@@ -84,9 +94,7 @@ def test_empty_install(servicer, client):
 
 
 def test_debian_slim_apt_install(servicer, client):
-    stub = Stub(
-        image=Image.debian_slim().pip_install(["numpy"]).apt_install(["git", "ssh"]).pip_install(["scikit-learn"])
-    )
+    stub = Stub(image=Image.debian_slim().pip_install("numpy").apt_install("git", "ssh").pip_install("scikit-learn"))
 
     with stub.run(client=client) as running_app:
         layers = get_image_layers(running_app["image"].object_id, servicer)
@@ -96,10 +104,20 @@ def test_debian_slim_apt_install(servicer, client):
         assert any("pip install numpy" in cmd for cmd in layers[2].dockerfile_commands)
 
 
+def test_image_pip_install_pyproject(servicer, client):
+    pyproject_toml = os.path.join(os.path.dirname(__file__), "supports/test-pyproject.toml")
+
+    stub = Stub()
+    stub["image"] = Image.debian_slim().pip_install_from_pyproject(pyproject_toml)
+    with stub.run(client=client) as running_app:
+        layers = get_image_layers(running_app["image"].object_id, servicer)
+
+        print(layers[0].dockerfile_commands)
+        assert any("pip install 'banana >=1.2.0' 'potato >=0.1.0'" in cmd for cmd in layers[0].dockerfile_commands)
+
+
 def test_conda_install(servicer, client):
-    stub = Stub(
-        image=Image.conda().pip_install(["numpy"]).conda_install(["pymc3", "theano"]).pip_install(["scikit-learn"])
-    )
+    stub = Stub(image=Image.conda().pip_install("numpy").conda_install("pymc3", "theano").pip_install("scikit-learn"))
 
     with stub.run(client=client) as running_app:
         layers = get_image_layers(running_app["image"].object_id, servicer)
@@ -152,7 +170,7 @@ def test_image_run_function(client, servicer):
     volume = SharedVolume().persist("test-vol")
     stub["image"] = (
         Image.debian_slim()
-        .pip_install(["pandas"])
+        .pip_install("pandas")
         .run_function(run_f, secrets=[Secret({"xyz": "123"})], shared_volumes={"/foo": volume})
     )
 
@@ -189,3 +207,23 @@ def test_poetry(client, servicer):
         layers = get_image_layers(running_app["image"].object_id, servicer)
         context_files = {f.filename for layer in layers for f in layer.context_files}
         assert context_files == {"/.poetry.lock", "/.pyproject.toml", "/modal_requirements.txt"}
+
+
+def test_image_build_with_context_mount(client, servicer, tmp_path):
+    (tmp_path / "data.txt").write_text("hello")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "sub").write_text("world")
+
+    data_mount = Mount(local_dir=tmp_path, remote_dir="/")
+
+    stub = Stub()
+    stub["image"] = Image.debian_slim().copy(data_mount, remote_path="/dummy")
+
+    with stub.run(client=client) as running_app:
+        layers = get_image_layers(running_app["image"].object_id, servicer)
+        assert "COPY . /dummy" in layers[0].dockerfile_commands
+        assert layers[0].context_mount_id == "mo-123"
+        files = {f.rel_filename: f.content for f in data_mount._get_files()}
+        assert files["data.txt"] == b"hello"
+        assert files[os.path.join("data", "sub")] == b"world"
+        assert len(files) == 2
