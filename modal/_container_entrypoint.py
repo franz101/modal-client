@@ -39,8 +39,6 @@ from .config import logger
 from .exception import InvalidError
 from .functions import AioFunctionHandle, FunctionHandle, _set_current_input_id
 
-MAX_OUTPUT_BATCH_SIZE = 100
-
 RTT_S = 0.5  # conservative estimate of RTT in seconds.
 
 
@@ -192,63 +190,40 @@ class _FunctionIOManager:
                 await asyncio.sleep(response.rate_limit_sleep_duration)
                 continue
 
-            if not response.inputs:
-                continue
+            assert len(response.inputs) == 1
+            item = response.inputs[0]
 
-            for item in response.inputs:
-                if item.kill_switch:
-                    logger.debug(f"Task {self.task_id} input received kill signal.")
-                    eof_received = True
-                    break
+            if item.kill_switch:
+                logger.debug(f"Task {self.task_id} input received kill signal.")
+                eof_received = True
+                break
 
-                # If we got a pointer to a blob, download it from S3.
-                if item.input.WhichOneof("args_oneof") == "args_blob_id":
-                    input_pb = await self.populate_input_blobs(item.input)
-                else:
-                    input_pb = item.input
+            # If we got a pointer to a blob, download it from S3.
+            if item.input.WhichOneof("args_oneof") == "args_blob_id":
+                input_pb = await self.populate_input_blobs(item.input)
+            else:
+                input_pb = item.input
 
-                yield (item.input_id, input_pb)
+            yield (item.input_id, input_pb)
 
-                if item.input.final_input:
-                    eof_received = True
-                    break
-
-    async def _send_outputs(self):
-        """Background task that tries to drain output queue until it's empty,
-        or the output buffer changes, and then sends the entire batch in one request.
-        """
-        async for outputs in queue_batch_iterator(self.output_queue, MAX_OUTPUT_BATCH_SIZE, 0):
-            req = api_pb2.FunctionPutOutputsRequest(outputs=outputs)
-            await retry_transient_errors(
-                self.client.stub.FunctionPutOutputs,
-                req,
-                attempt_timeout=3.0,
-                total_timeout=20.0,
-                additional_status_codes=[Status.RESOURCE_EXHAUSTED],
-            )
-            # TODO(erikbern): we'll get a RESOURCE_EXCHAUSTED if the buffer is full server-side.
-            # It's possible we want to retry "harder" for this particular error.
+            if item.input.final_input:
+                eof_received = True
+                break
 
     async def run_inputs_outputs(self):
-        # This also makes sure to terminate the outputs
-        self.output_queue: asyncio.Queue = asyncio.Queue()
-
         async with TaskContext(grace=10) as tc:
             tc.create_task(self._send_outputs())
-            try:
-                async for input_id, input_pb in self._generate_inputs():
-                    args, kwargs = self.deserialize(input_pb.args) if input_pb.args else ((), {})
-                    _set_current_input_id(input_id)
-                    self.current_input_id, self.current_input_started_at = (input_id, time.time())
-                    yield input_id, args, kwargs
-                    _set_current_input_id(None)
-                    self.total_user_time += time.time() - self.current_input_started_at
-                    self.current_input_id, self.current_input_started_at = (None, None)
-                    self.calls_completed += 1
-            finally:
-                await self.output_queue.put(None)
+            async for input_id, input_pb in self._generate_inputs():
+                args, kwargs = self.deserialize(input_pb.args) if input_pb.args else ((), {})
+                _set_current_input_id(input_id)
+                self.current_input_id, self.current_input_started_at = (input_id, time.time())
+                yield input_id, args, kwargs
+                _set_current_input_id(None)
+                self.total_user_time += time.time() - self.current_input_started_at
+                self.current_input_id, self.current_input_started_at = (None, None)
+                self.calls_completed += 1
 
-    async def _enqueue_output(self, input_id, gen_index, **kwargs):
+    async def _send_output(self, input_id, gen_index, **kwargs):
         # upload data to S3 if too big.
         if "data" in kwargs and kwargs["data"] and len(kwargs["data"]) > MAX_OBJECT_SIZE_BYTES:
             data_blob_id = await blob_upload(kwargs["data"], self.client.stub)
@@ -263,7 +238,14 @@ class _FunctionIOManager:
             gen_index=gen_index,
             result=api_pb2.GenericResult(**kwargs),
         )
-        await self.output_queue.put(output)
+        req = api_pb2.FunctionPutOutputsRequest(outputs=[output])
+        await retry_transient_errors(
+            self.client.stub.FunctionPutOutputs,
+            req,
+            attempt_timeout=2.0,
+            total_timeout=10.0,
+            additional_status_codes=[Status.RESOURCE_EXHAUSTED],
+        )
 
     def serialize_exception(self, exc: BaseException) -> Optional[bytes]:
         try:
@@ -334,7 +316,7 @@ class _FunctionIOManager:
             # serializing the exception, which may have some issues (there
             # was an earlier note about it that it might not be possible
             # to unpickle it in some cases). Let's watch out for issues.
-            await self._enqueue_output(
+            await self._send_output(
                 input_id,
                 output_index.value,
                 status=api_pb2.GenericResult.GENERIC_STATUS_FAILURE,
@@ -345,16 +327,16 @@ class _FunctionIOManager:
                 tb_line_cache=tb_line_cache,
             )
 
-    async def enqueue_output(self, input_id, output_index: int, data):
-        await self._enqueue_output(
+    async def send_output(self, input_id, output_index: int, data):
+        await self._send_output(
             input_id,
             gen_index=output_index,
             status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS,
             data=self.serialize(data),
         )
 
-    async def enqueue_generator_value(self, input_id, output_index: int, data):
-        await self._enqueue_output(
+    async def send_generator_value(self, input_id, output_index: int, data):
+        await self._send_output(
             input_id,
             gen_index=output_index,
             status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS,
@@ -362,8 +344,8 @@ class _FunctionIOManager:
             gen_status=api_pb2.GenericResult.GENERATOR_STATUS_INCOMPLETE,
         )
 
-    async def enqueue_generator_eof(self, input_id, output_index: int):
-        await self._enqueue_output(
+    async def send_generator_eof(self, input_id, output_index: int):
+        await self._send_output(
             input_id,
             gen_index=output_index,
             status=api_pb2.GenericResult.GENERIC_STATUS_SUCCESS,
@@ -402,17 +384,17 @@ def call_function_sync(
                         raise InvalidError(f"Generator function returned value of type {type(res)}")
 
                     for value in res:
-                        function_io_manager.enqueue_generator_value(input_id, output_index.value, value)
+                        function_io_manager.send_generator_value(input_id, output_index.value, value)
                         output_index.increase()
 
-                    function_io_manager.enqueue_generator_eof(input_id, output_index.value)
+                    function_io_manager.send_generator_eof(input_id, output_index.value)
                 else:
                     if inspect.iscoroutine(res) or inspect.isgenerator(res) or inspect.isasyncgen(res):
                         raise InvalidError(
                             f"Sync (non-generator) function return value of type {type(res)}."
                             " You might need to use @stub.function(..., is_generator=True)."
                         )
-                    function_io_manager.enqueue_output(input_id, output_index.value, res)
+                    function_io_manager.send_output(input_id, output_index.value, res)
     finally:
         if obj is not None and hasattr(obj, "__exit__"):
             with function_io_manager.handle_user_exception():
@@ -447,9 +429,9 @@ async def call_function_async(
                     if not inspect.isasyncgen(res):
                         raise InvalidError(f"Async generator function returned value of type {type(res)}")
                     async for value in res:
-                        await aio_function_io_manager.enqueue_generator_value(input_id, output_index.value, value)
+                        await aio_function_io_manager.send_generator_value(input_id, output_index.value, value)
                         output_index.increase()
-                    await aio_function_io_manager.enqueue_generator_eof(input_id, output_index.value)
+                    await aio_function_io_manager.send_generator_eof(input_id, output_index.value)
                 else:
                     if not inspect.iscoroutine(res) or inspect.isgenerator(res) or inspect.isasyncgen(res):
                         raise InvalidError(
@@ -457,7 +439,7 @@ async def call_function_async(
                             " You might need to use @stub.function(..., is_generator=True)."
                         )
                     value = await res
-                    await aio_function_io_manager.enqueue_output(input_id, output_index.value, value)
+                    await aio_function_io_manager.send_output(input_id, output_index.value, value)
     finally:
         if obj is not None:
             if hasattr(obj, "__aexit__"):
